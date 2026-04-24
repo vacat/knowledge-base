@@ -1,0 +1,12 @@
+# Core dependencies
+feedparser>=6.0.0
+requests>=2.31.0
+
+# Optional: Jina Reader for better content extraction
+# jina>=0.0.8
+
+# Optional: Anthropic Claude (for classification fallback)
+# anthropic>=0.21.0
+
+# Optional: Zhipu GLM (for classification fallback)
+# zhipuai>=2.0.0

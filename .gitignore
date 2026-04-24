@@ -1,0 +1,30 @@
+# Environment (secrets)
+.env
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (processed state — keep feed_state.json and processed_bookmarks.json in git)
+# Uncomment if you want to keep all data local only:
+# data/processed_bookmarks.json
+# data/feed_state.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Local vault (if you clone into Obsidian)
+# .obsidian/

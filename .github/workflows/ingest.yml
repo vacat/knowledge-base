@@ -1,0 +1,84 @@
+name: Ingest Knowledge Sources
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # 每30分钟跑一次
+  workflow_dispatch:  # 手动触发
+  repository_dispatch:
+    types: [trigger-ingest]  # API 触发
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25  # 避免超时扣额度
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          persist-credentials: true
+          fetch-depth: 1  # 浅克隆，节省时间
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate environment
+        run: python scripts/validate_env.py
+
+      - name: Run ingestion
+        env:
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+          X_USER_ID: ${{ secrets.X_USER_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          GH_ACTOR: ${{ github.actor }}
+        run: python scripts/ingest.py
+
+      - name: Check for changes
+        id: git-status
+        run: |
+          git config user.name "Knowledge Bot"
+          git config user.email "bot@knowledge.local"
+          git status --porcelain | tee /tmp/status.txt
+          if [ -s /tmp/status.txt ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No new content to commit"
+          fi
+
+      - name: Commit and push
+        if: steps.git-status.outputs.has_changes == 'true'
+        run: |
+          git add raw/ wiki/ data/
+          git commit -m "ingest: $(date -u '+%Y-%m-%d %H:%M') [skip ci]"
+          git push
+          
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-logs
+          path: logs/*.log
+          retention-days: 3
