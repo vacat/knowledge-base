@@ -25,6 +25,8 @@ import os
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -67,6 +69,10 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 
 
 def llm_classify(text: str, url: str) -> dict:
@@ -110,6 +116,12 @@ def llm_classify(text: str, url: str) -> dict:
         return _llm_anthropic(text[:3000], ANTHROPIC_API_KEY)
     elif LLM_PROVIDER == "zhipu" and ZHIPU_API_KEY:
         return _llm_zhipu(text[:3000], ZHIPU_API_KEY)
+    elif LLM_PROVIDER == "deepseek" and DEEPSEEK_API_KEY:
+        return _llm_deepseek(payload, DEEPSEEK_API_KEY)
+    elif LLM_PROVIDER == "groq" and GROQ_API_KEY:
+        return _llm_groq(payload, GROQ_API_KEY)
+    elif LLM_PROVIDER == "ollama":
+        return _llm_ollama(payload)
     else:
         log.warning("No LLM API key — using rule-based fallback classification")
         return _rule_classify(url, text[:500])
@@ -169,11 +181,46 @@ def _llm_zhipu(text: str, api_key: str) -> dict:
     return json.loads(resp.json()["choices"][0]["message"]["content"])
 
 
+def _llm_deepseek(payload: dict, api_key: str) -> dict:
+    resp = requests.post(
+        "https://api.deepseek.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={**payload, "model": "deepseek-chat"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return json.loads(resp.json()["choices"][0]["message"]["content"])
+
+
+def _llm_groq(payload: dict, api_key: str) -> dict:
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={**payload, "model": "llama-3.3-70b-versatile"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return json.loads(resp.json()["choices"][0]["message"]["content"])
+
+
+def _llm_ollama(payload: dict) -> dict:
+    """Ollama local model — OpenAI-compatible endpoint."""
+    # Ollama doesn't support response_format
+    payload = {k: v for k, v in payload.items() if k != "response_format"}
+    resp = requests.post(
+        f"{OLLAMA_BASE_URL}/v1/chat/completions",
+        json={**payload, "model": OLLAMA_MODEL},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return json.loads(resp.json()["choices"][0]["message"]["content"])
+
+
 def _rule_classify(url: str, text: str) -> dict:
     """Fallback when no LLM is available — rule-based classification."""
     text_lower = (url + " " + text).lower()
     if any(k in text_lower for k in ["ai", "llm", "gpt", "transformer", "neural", "diffusion"]):
-        cat = "AI-ML"
+        cat = "ai-ml"
     elif any(k in text_lower for k in ["python", "javascript", "code", "github", "api", "programming"]):
         cat = "coding"
     elif any(k in text_lower for k in ["design", "figma", "ui", "ux", "interface"]):
@@ -381,7 +428,7 @@ def get_new_rss_items() -> list[dict]:
 
             for entry in feed.entries:
                 published = _parse_feed_date(entry.get("published", ""))
-                if published and published.isoformat() > last_run:
+                if published and str(published) > last_run:
                     all_items.append({
                         "id": entry.get("id", entry.link),
                         "url": entry.link,
@@ -401,22 +448,30 @@ def get_new_rss_items() -> list[dict]:
         FEED_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
 
     log.info(f"RSS: fetched {len(all_items)} new items from {len(feeds)} feeds")
+    log.info(f"  Sample items: {[{'title': i['title'][:40], 'published': i['published']} for i in all_items[:3]]}")
     return all_items
 
 
 def _parse_feed_date(date_str: str) -> Optional[datetime.datetime]:
-    """Parse common feed date formats."""
+    """Parse common feed date formats, always returning UTC."""
     if not date_str:
         return None
     formats = [
         "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%dT%H:%M:%SZ",
         "%a, %d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S GMT",
         "%Y-%m-%d %H:%M:%S",
     ]
     for fmt in formats:
         try:
-            return datetime.datetime.strptime(date_str.strip(), fmt)
+            dt = datetime.datetime.strptime(date_str.strip(), fmt)
+            # Normalize to UTC
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            else:
+                dt = dt.astimezone(datetime.timezone.utc)
+            return dt
         except ValueError:
             continue
     return None
@@ -470,74 +525,84 @@ summary: "{meta.get("summary", "")}"
 # ─── Rate Limiter ─────────────────────────────────────────────────────────────
 
 class RateLimiter:
-    """Simple token bucket rate limiter for API calls."""
+    """Thread-safe token bucket rate limiter for API calls."""
 
     def __init__(self, calls_per_minute: int = 60):
         self.interval = 60.0 / calls_per_minute
         self.last_call = 0.0
+        self._lock = threading.Lock()
 
     def wait(self):
-        elapsed = time.time() - self.last_call
-        if elapsed < self.interval:
-            time.sleep(self.interval - elapsed)
-        self.last_call = time.time()
+        with self._lock:
+            elapsed = time.time() - self.last_call
+            if elapsed < self.interval:
+                time.sleep(self.interval - elapsed)
+            self.last_call = time.time()
+
+
+# ─── Item Processor ────────────────────────────────────────────────────────────
+
+def process_item(item: dict, source: str) -> tuple[bool, str, str]:
+    """Process a single item: extract content, classify, save. Returns (success, url, error)."""
+    url = item["url"]
+    try:
+        content = extract_content(url) or item.get("summary", "")
+        if not content or len(content) < 100:
+            return (False, url, "content too short")
+        meta = llm_classify(content, url)
+        save_raw_markdown(url, content, meta, source=source)
+        return (True, url, "")
+    except Exception as e:
+        return (False, url, str(e))
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 rate_limit = RateLimiter(calls_per_minute=30)  # Be respectful to APIs
 
 
 def main():
     log.info(f"=== Ingestion run started at {datetime.datetime.utcnow().isoformat()}Z ===")
+    log.info(f"Provider: {LLM_PROVIDER}, Max workers: {MAX_WORKERS}")
 
     total_saved = 0
     errors = 0
+    processed_urls = set()
 
     # ── 1. X Bookmarks ────────────────────────────────────────────────────────
     log.info("─── Fetching X Bookmarks ───")
     x_items = get_x_bookmarks()
-    for item in x_items:
-        rate_limit.wait()
-        url = item["url"]
-        log.info(f"  Processing X bookmark: {url}")
-
-        content = extract_content(url)
-        if not content or len(content) < 100:
-            log.warning(f"  ✗ Could not extract content from {url}")
-            errors += 1
-            continue
-
-        try:
-            meta = llm_classify(content, url)
-            save_raw_markdown(url, content, meta, source="x")
-            total_saved += 1
-        except Exception as e:
-            log.error(f"  ✗ LLM classify failed for {url}: {e}")
-            errors += 1
+    if x_items:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_item, item, "x"): item for item in x_items}
+            for future in as_completed(futures):
+                rate_limit.wait()
+                success, url, err = future.result()
+                if success:
+                    total_saved += 1
+                    processed_urls.add(url)
+                else:
+                    log.error(f"  ✗ Failed X bookmark {url}: {err}")
+                    errors += 1
 
     # ── 2. RSS Feeds ──────────────────────────────────────────────────────────
     log.info("─── Fetching RSS Feeds ───")
     rss_items = get_new_rss_items()
-    for item in rss_items:
-        rate_limit.wait()
-        url = item["url"]
-        log.info(f"  Processing RSS item: {item['title'][:60]}")
+    log.info(f"Got {len(rss_items)} new RSS items")
 
-        # Use summary if full content not available
-        content = extract_content(url) or item.get("summary", "")
-        if not content or len(content) < 100:
-            log.warning(f"  ✗ Could not extract content from {url}")
-            errors += 1
-            continue
-
-        try:
-            meta = llm_classify(content, url)
-            save_raw_markdown(url, content, meta, source="rss")
-            total_saved += 1
-        except Exception as e:
-            log.error(f"  ✗ LLM classify failed for {url}: {e}")
-            errors += 1
+    if rss_items:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_item, item, "rss"): item for item in rss_items}
+            for future in as_completed(futures):
+                rate_limit.wait()
+                success, url, err = future.result()
+                if success:
+                    total_saved += 1
+                    processed_urls.add(url)
+                else:
+                    log.error(f"  ✗ Failed RSS item {url}: {err}")
+                    errors += 1
 
     # ── Summary ──────────────────────────────────────────────────────────────
     log.info(f"=== Ingestion complete: {total_saved} saved, {errors} errors ===")
