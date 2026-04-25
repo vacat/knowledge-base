@@ -42,7 +42,11 @@ CONCEPTS_DIR = WIKI_DIR / "concepts"
 SUMMARIES_DIR = WIKI_DIR / "summaries"
 INDEX_FILE = WIKI_DIR / "index.md"
 
-CATEGORIES = ["AI-ML", "coding", "design", "productivity", "research", "business", "other"]
+CATEGORIES = ["ai-ml", "coding", "design", "productivity", "research", "business", "other"]
+
+# Ensure directories exist
+CONCEPTS_DIR.mkdir(parents=True, exist_ok=True)
+SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─── LLM Setup ──────────────────────────────────────────────────────────────────
 
@@ -113,7 +117,7 @@ def extract_concepts(raw_file: Path, content: str, url: str) -> list[dict]:
             if line.startswith("##"):
                 name = line.lstrip("#").strip()
                 concept_names.add(name)
-        return [{"name": n, "body": response, "source_url": url}] for n in concept_names]
+        return [{"name": n, "body": response, "source_url": url} for n in concept_names]
     except Exception as e:
         log.error(f"Concept extraction failed for {raw_file}: {e}")
         return []
@@ -215,10 +219,12 @@ def main():
                     if len(parts) >= 3:
                         frontmatter = parts[1]
                         body = parts[2]
-                        meta = dict(re.findall(r"(\w+): (.+)", frontmatter))
-                        meta["url"] = re.search(r"source: (.+)", frontmatter)
-                        if meta["url"]:
-                            meta["url"] = meta["url"].group(1)
+                        meta = {}
+                        for line in frontmatter.strip().split("\n"):
+                            if ": " in line:
+                                key, val = line.split(": ", 1)
+                                meta[key.strip()] = val.strip()
+                        url = meta.get("source", "")
                         score = int(meta.get("score", 5))
                     else:
                         body = text

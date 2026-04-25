@@ -50,10 +50,13 @@ log = logging.getLogger("ingest")
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 RAW_DIR = REPO_ROOT / "raw"
 DATA_DIR = REPO_ROOT / "data"
-CATEGORIES = ["AI-ML", "coding", "design", "productivity", "research", "business", "other"]
+CATEGORIES = ["ai-ml", "coding", "design", "productivity", "research", "business", "other"]
 
 for cat in CATEGORIES:
     (RAW_DIR / cat).mkdir(parents=True, exist_ok=True)
+
+# Ensure lowercase category dirs exist (migrate from old "AI-ML" naming)
+(RAW_DIR / "AI-ML").mkdir(parents=True, exist_ok=True)  # legacy
 
 (DATA_DIR).mkdir(parents=True, exist_ok=True)
 DATA_DIR.joinpath(".gitkeep").touch()
